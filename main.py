@@ -9,21 +9,11 @@ import shutil
 import re
 import datetime
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import traceback
 
 app = FastAPI()
-
-@app.post("/connect-sap")
-async def connect_sap():
-    global sap_session
-    try:
-        SapGuiAuto = win32com.client.GetObject("SAPGUI")
-        application = SapGuiAuto.GetScriptingEngine
-        connection = application.OpenConnection("S4HANA", True)  # must match SAP Logon entry
-        sap_session = connection.Children(0)
-        return {"status": "connected"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect to SAP: {e}")
 
 # CORS configuration for frontend
 app.add_middleware(
@@ -42,14 +32,15 @@ SAP_PASS = "Lahore@123"
 SAP_LANG = "EN"
 
 # Template path
-TEMPLATE_PATH = r"C:\Users\atif.pirzada\Downloads\SESinfo.docx"
+TEMPLATE_PATH = r"SESinfo.docx"
 
-# Output directory for generated files (separate from Downloads)
+# Output directory for generated files
 OUTPUT_DIR = os.path.join(os.path.dirname(TEMPLATE_PATH), "SES_Generated")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 class PORequest(BaseModel):
     po_number: int
+    distribution_name: str
 
 class SAPExtractor:
     def __init__(self):
@@ -108,7 +99,7 @@ class SAPExtractor:
         return cleaned
     
     def extract_vendor_name(self):
-        """Extract vendor name from PO - Enhanced with multiple attempts"""
+        """Extract vendor name from PO"""
         vendor_name = ""
         
         # Method 1: Try the primary field
@@ -117,10 +108,9 @@ class SAPExtractor:
             raw_vendor_name = vendor_name_field.text
             if raw_vendor_name.strip():
                 vendor_name = self.clean_vendor_name(raw_vendor_name)
-                print(f"✓ Found vendor (Method 1): {vendor_name}")
                 return vendor_name
-        except Exception as e:
-            print(f"Method 1 failed: {e}")
+        except:
+            pass
         
         # Method 2: Try alternative vendor fields
         alternative_vendor_fields = [
@@ -129,46 +119,16 @@ class SAPExtractor:
             "wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB2:SAPLMEGUI:1200/txtLFA1-NAME1"
         ]
         
-        for idx, field_id in enumerate(alternative_vendor_fields):
+        for field_id in alternative_vendor_fields:
             try:
                 vendor_field = self.session.findById(field_id)
                 raw_vendor_name = vendor_field.text
                 if raw_vendor_name.strip():
                     vendor_name = self.clean_vendor_name(raw_vendor_name)
-                    print(f"✓ Found vendor (Method 2.{idx+1}): {vendor_name}")
                     return vendor_name
-            except Exception as e:
-                print(f"Method 2.{idx+1} failed: {e}")
+            except:
                 continue
         
-        # Method 3: Click on Header tab and try to extract
-        try:
-            print("Attempting Method 3: Clicking Header tab...")
-            # Try to click on Header/Document tab
-            self.session.findById("wnd[0]/usr/subSUB0:SAPLMEGUI:0019/subSUB0:SAPLMEGUI:0030/subSUB1:SAPLMEGUI:1105/btnDYN_1100-BUTTON").press()
-            time.sleep(1)
-            
-            # Now try vendor fields again
-            vendor_fields_after_click = [
-                "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB0:SAPLMEGUI:0030/subSUB1:SAPLMEGUI:1105/ctxtMEPO1105-SUPERFIELD",
-                "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB1:SAPLMEGUI:0100/txtEKKO-LIFNR",
-                "wnd[0]/usr/subSUB0:SAPLMEGUI:0013/subSUB1:SAPLMEGUI:0100/ctxtEKKO-LIFNR"
-            ]
-            
-            for idx, field_id in enumerate(vendor_fields_after_click):
-                try:
-                    vendor_field = self.session.findById(field_id)
-                    raw_vendor_name = vendor_field.text
-                    if raw_vendor_name.strip():
-                        vendor_name = self.clean_vendor_name(raw_vendor_name)
-                        print(f"✓ Found vendor (Method 3.{idx+1}): {vendor_name}")
-                        return vendor_name
-                except:
-                    continue
-        except Exception as e:
-            print(f"Method 3 failed: {e}")
-        
-        print(f"⚠ Warning: Could not find vendor name")
         return ""
     
     def clean_amount(self, raw_amount):
@@ -264,7 +224,6 @@ class SAPExtractor:
                                 "amount": invoice_clean
                             })
                             seen_keys.add(key)
-                            print(f"✓ Found service: Line {line_number}, Service: {service_name[:50]}, Amount: {invoice_clean}")
                     except:
                         continue
                 
@@ -279,11 +238,8 @@ class SAPExtractor:
             
             services_found.sort(key=lambda x: int(x['line']) if x['line'].isdigit() else 9999)
             
-            print(f"✓ Total services extracted: {len(services_found)}")
-            
         except Exception as e:
             print(f"Error extracting services: {e}")
-            traceback.print_exc()
         
         return services_found
     
@@ -295,115 +251,161 @@ class SAPExtractor:
         except:
             pass
 
-def fill_ses_template(template_path, po_number, vendor_name, service_items):
+def add_bullet(paragraph, text):
+    """
+    Turn a paragraph into a bulleted item with given text.
+    """
+    # clear any existing text
+    paragraph.clear()
+    run = paragraph.add_run(text)
+
+    # Apply bullet numbering (list style) using XML
+    p = paragraph._p  # lxml element
+    pPr = p.get_or_add_pPr()
+    numPr = OxmlElement('w:numPr')
+
+    ilvl = OxmlElement('w:ilvl')
+    ilvl.set(qn('w:val'), "0")
+    numPr.append(ilvl)
+
+    numId = OxmlElement('w:numId')
+    numId.set(qn('w:val'), "1")  # bullet list id
+    numPr.append(numId)
+
+    pPr.append(numPr)
+
+def fill_ses_template(template_path, po_number, vendor_name, service_items, distribution_name):
     """Fill SES template with extracted data"""
     try:
-        # Save to OUTPUT_DIR instead of same directory as template
         base_name = os.path.basename(template_path)
         name, ext = os.path.splitext(base_name)
+
+        # Always save to OUTPUT_DIR
         new_file_path = os.path.join(OUTPUT_DIR, f"{name}_PO_{po_number}{ext}")
         shutil.copyfile(template_path, new_file_path)
         
         doc = Document(new_file_path)
         current_date = datetime.datetime.now().strftime("%d.%m.%Y")
-        
-        # Build amount lines
+
+        # Build amount lines (formatted with commas)
         amount_lines = []
         for s in service_items:
             line_num = s.get("line", "").strip()
             amt = s.get("amount", "").strip()
-            if amt:
-                line_text = f"Amount Rs: {amt} - line item# {line_num}"
+            
+            if amt and amt.isdigit():
+                amt_formatted = "{:,}".format(int(amt))
+            else:
+                amt_formatted = amt
+
+            if amt_formatted:
+                line_text = f"Amount Rs: {amt_formatted} - line item# {line_num}"
             else:
                 line_text = f"Amount Rs: - line item# {line_num}"
+
             amount_lines.append(line_text)
-        
-        print(f"DEBUG: Processing {len(doc.paragraphs)} paragraphs")
-        
+
+        # --- Replace table fields (Date and Distribution) ---
+        date_replaced = False
+        distribution_replaced = False
+        for table in doc.tables:
+            for row in table.rows:
+                cells_text = [cell.text for cell in row.cells]
+                if not date_replaced and any("Date:" in t for t in cells_text):
+                    for idx, cell in enumerate(row.cells):
+                        if "Date:" in cell.text and idx + 1 < len(row.cells):
+                            for p in row.cells[idx + 1].paragraphs:
+                                p.text = current_date
+                            date_replaced = True
+                            break
+                if not distribution_replaced and any("Distribution:" in t for t in cells_text):
+                    for idx, cell in enumerate(row.cells):
+                        if "Distribution:" in cell.text and idx + 1 < len(row.cells):
+                            for p in row.cells[idx + 1].paragraphs:
+                                p.text = distribution_name
+                            distribution_replaced = True
+                            break
+                if date_replaced and distribution_replaced:
+                    break
+            if date_replaced and distribution_replaced:
+                break
+
+        # --- Replace placeholders in text ---
         replaced_amounts = False
-        for idx, p in enumerate(doc.paragraphs):
-            original_txt = p.text
-            txt = original_txt
-            
-            # Replace PO# - more flexible pattern
+        paragraph_to_remove = None
+        
+        for p in doc.paragraphs:
+            txt = p.text
+
             if "PO#" in txt:
                 txt = re.sub(r'PO#\s*\d*', f'PO# {po_number}', txt)
-                print(f"DEBUG: Replaced PO# in paragraph {idx}")
-            
-            # Replace vendor
-            if "in favor of" in txt:
-                print(f"DEBUG: Found 'in favor of' in paragraph {idx}: {repr(txt)}")
-                if vendor_name:
-                    parts = txt.split("in favor of")
-                    if len(parts) >= 2:
-                        before = parts[0] + "in favor of"
-                        after = parts[1]
-                        
-                        if "for taking" in after:
-                            after_parts = after.split("for taking", 1)
-                            txt = f'{before} "{vendor_name}" for taking{after_parts[1]}'
-                        else:
-                            txt = f'{before} "{vendor_name}"'
-                        print(f"DEBUG: Replaced vendor in paragraph {idx}: {vendor_name}")
-            
-            # Replace services
+
+            if "in favor of" in txt and vendor_name:
+                parts = txt.split("in favor of")
+                if len(parts) >= 2:
+                    before = parts[0] + "in favor of"
+                    after = parts[1]
+                    if "for taking" in after:
+                        after_parts = after.split("for taking", 1)
+                        txt = f'{before} "{vendor_name}" for taking{after_parts[1]}'
+                    else:
+                        txt = f'{before} "{vendor_name}"'
+
             if "for taking the services of" in txt:
-                print(f"DEBUG: Found 'for taking the services of' in paragraph {idx}: {repr(txt)}")
-                service_names = [s["service"] for s in service_items if s.get("service")]
-                if service_names:
-                    all_services = ", ".join(service_names)
+                services = [s["service"] for s in service_items if s.get("service")]
+                if services:
+                    all_services = ", ".join(services)
                     parts = txt.split("for taking the services of")
-                    if len(parts) >= 2:
-                        before = parts[0] + "for taking the services of"
-                        after = parts[1]
-                        after_clean = re.sub(r'^["""\'\'"\s]+', '', after)
-                        txt = f'{before} "{all_services}"'
-                        remaining = re.sub(r'^["""\'\'"\s]+', '', after_clean)
-                        if remaining:
-                            txt = f'{before} "{all_services}"{remaining}'
-                        print(f"DEBUG: Replaced services in paragraph {idx}: {all_services}")
-            
-            # Replace Amount Rs lines
+                    txt = f'{parts[0]}for taking the services of "{all_services}"'
+
+            # If amount placeholder exists → replace with bullet list
             if "Amount Rs:" in txt and "line item" in txt:
                 if amount_lines:
-                    txt = "\n".join(amount_lines)
-                    print(f"DEBUG: Replaced amount in paragraph {idx}")
-                replaced_amounts = True
-            
-            # --- Replace date ---
-            # Case 1: if template has “ “ (empty quotes)
-            if "Date" in txt and "“" in txt and "”" in txt:
-                txt = txt.replace("“ “", current_date)
-                print(f"DEBUG: Replaced empty date quotes in paragraph {idx}")
-            
-            # Case 2: if template has a stale dd.mm.yyyy date
-            if re.search(r'\d{2}\.\d{2}\.\d{4}', txt):
-                txt = re.sub(r'\d{2}\.\d{2}\.\d{4}', current_date, txt)
-                print(f"DEBUG: Replaced existing date in paragraph {idx}")
-            
-            # Apply changes
-            if txt != original_txt:
+                    paragraph_to_remove = p  # Mark for removal
+                    # Insert bullet points BEFORE this paragraph
+                    for line in amount_lines:
+                        new_p = p.insert_paragraph_before("")
+                        add_bullet(new_p, line)
+                    replaced_amounts = True
+                continue
+
+            # For all other cases → update normally
+            if txt != p.text:
                 p.text = txt
-        
+
+        # Remove the original placeholder paragraph (which is now empty with a bullet)
+        if paragraph_to_remove is not None:
+            paragraph_to_remove._element.getparent().remove(paragraph_to_remove._element)
+
+        # If no placeholder existed → append bullet list at end
         if not replaced_amounts and amount_lines:
-            doc.add_paragraph("\n".join(amount_lines))
-            print("DEBUG: Added amount lines as new paragraph")
-        
+            for line in amount_lines:
+                new_p = doc.add_paragraph("")
+                add_bullet(new_p, line)
+
         doc.save(new_file_path)
-        print(f"✓ Document saved: {new_file_path}")
-        print(f"✓ Vendor filled: {vendor_name}")
-        print(f"✓ Services filled: {', '.join([s['service'] for s in service_items if s.get('service')])}")
+        print(f"Document saved: {new_file_path}")
         return new_file_path
-        
+
     except Exception as e:
         print(f"Error filling template: {e}")
         traceback.print_exc()
         return None
 
-
 @app.get("/")
 def read_root():
     return {"message": "SES Generator API"}
+
+@app.post("/connect-sap")
+async def connect_sap():
+    """Test SAP connection endpoint"""
+    try:
+        return {
+            "success": True,
+            "message": "SAP will connect automatically when generating SES"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/generate-ses")
 async def generate_ses(request: PORequest):
@@ -411,48 +413,29 @@ async def generate_ses(request: PORequest):
     extractor = SAPExtractor()
     
     try:
-        print(f"\n{'='*50}")
-        print(f"Processing PO: {request.po_number}")
-        print(f"{'='*50}")
+        print(f"\nProcessing PO: {request.po_number}")
+        print(f"Distribution Name: {request.distribution_name}")
         
-        # Connect and login to SAP
-        print("→ Connecting to SAP...")
         extractor.connect_to_sap()
-        print("✓ Connected to SAP")
-        
-        print("→ Logging in...")
         extractor.login()
-        print("✓ Logged in")
-        
-        # Open PO
-        print(f"→ Opening PO {request.po_number}...")
         extractor.open_purchase_order(request.po_number)
-        print("✓ PO opened")
         
-        # Extract data
-        print("→ Extracting vendor name...")
         vendor_name = extractor.extract_vendor_name()
-        if vendor_name:
-            print(f"✓ Vendor: {vendor_name}")
-        else:
-            print("⚠ Vendor name not found!")
-        
-        print("→ Extracting service lines...")
         service_lines = extractor.extract_service_lines()
         
         if not service_lines:
             raise HTTPException(status_code=404, detail="No service lines found in PO")
         
-        # Generate document
-        print("→ Generating document...")
-        output_file = fill_ses_template(TEMPLATE_PATH, request.po_number, vendor_name, service_lines)
+        output_file = fill_ses_template(
+            TEMPLATE_PATH, 
+            request.po_number, 
+            vendor_name, 
+            service_lines,
+            request.distribution_name
+        )
         
         if not output_file or not os.path.exists(output_file):
             raise HTTPException(status_code=500, detail="Failed to generate document")
-        
-        print(f"{'='*50}")
-        print("✓ SUCCESS!")
-        print(f"{'='*50}\n")
         
         return {
             "success": True,
@@ -463,7 +446,7 @@ async def generate_ses(request: PORequest):
         }
         
     except Exception as e:
-        print(f"\n✗ ERROR: {str(e)}\n")
+        print(f"ERROR: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     
@@ -472,27 +455,19 @@ async def generate_ses(request: PORequest):
 
 @app.get("/download/{po_number}")
 async def download_file(po_number: int):
-    """Download generated SES document"""
     base_name = os.path.basename(TEMPLATE_PATH)
     name, ext = os.path.splitext(base_name)
     file_path = os.path.join(OUTPUT_DIR, f"{name}_PO_{po_number}{ext}")
     
-    print(f"Looking for file: {file_path}")
-    print(f"File exists: {os.path.exists(file_path)}")
-    
     if not os.path.exists(file_path):
-        print(f"Files in directory: {os.listdir(OUTPUT_DIR)}")
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-    
-    if not os.path.exists(file_path):
-        print(f"Files in directory: {os.listdir(OUTPUT_DIR)}")
         raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
     
     return FileResponse(
         path=file_path,
-        filename=f"SES_PO_{po_number}.docx",
+        filename=os.path.basename(file_path),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
+
 
 if __name__ == "__main__":
     import uvicorn
